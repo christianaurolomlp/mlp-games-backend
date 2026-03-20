@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+anthropic
+pytchat
+httpx
+python-multipart
