@@ -102,7 +102,7 @@ async def collect_chat(session_id: str, video_id: str, max_participants: int):
     try:
         # pytchat is synchronous, run in thread
         loop = asyncio.get_event_loop()
-        chat = await loop.run_in_executor(None, lambda: pytchat.create(video_id=video_id))
+        chat = await loop.run_in_executor(None, lambda: pytchat.create(video_id=video_id, interruptable=False))
 
         logger.info(f"[{session_id}] Started collecting from video {video_id}")
 
