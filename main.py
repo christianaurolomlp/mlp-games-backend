@@ -72,6 +72,8 @@ VALID_CRYPTOS = [
 class RaceStartRequest(BaseModel):
     video_id: str
     max_participants: int = 15
+    game_type: str = "race"  # "race" or "prediction"
+    asset: str = "BTC"  # For prediction game: which crypto to predict
 
 
 class RaceStopRequest(BaseModel):
@@ -136,7 +138,7 @@ async def collect_chat(session_id: str, video_id: str, max_participants: int):
 
 
 # ─── Claude AI Parser ────────────────────────────────────────────
-async def parse_with_claude(messages: list[dict], game_type: str) -> list[dict]:
+async def parse_with_claude(messages: list[dict], game_type: str, asset: str = "BTC") -> list[dict]:
     """Parse chat messages using Claude to extract participants."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -172,17 +174,23 @@ RESPONDE SOLO CON JSON (sin markdown, sin texto adicional):
 Si no encuentras ninguno válido, responde: []"""
     else:
         # prediction game_type
-        prompt = f"""Eres un extractor de datos de chat de YouTube para un juego de predicción de precio de BTC.
+        prompt = f"""Eres un extractor de datos de chat de YouTube para un juego de predicción de precio de {asset}.
 
 COMENTARIOS DEL CHAT:
 {chat_text}
 
 INSTRUCCIONES:
-1. Extrae el nombre de usuario de YouTube
-2. Extrae el número que predicen como precio de BTC (en USD)
-3. Ignora líneas de sistema de YouTube
+1. Extrae el nombre de usuario de YouTube (el autor del mensaje)
+2. Extrae el número que predicen como precio de {asset} (en USD)
+3. Ignora líneas de sistema de YouTube (como "Top Fans", "Actividad del canal", etc.)
 4. Si un usuario aparece varias veces, usa SOLO su ÚLTIMA predicción
-5. El número puede estar con o sin separador de miles (ej: 100000, 100.000, 100,000)
+5. El número puede estar en muchos formatos:
+   - Con separador de miles: 100.000 o 100,000
+   - Sin separador: 100000
+   - Con K: "71k" = 71000, "2.5k" = 2500
+   - Con símbolo $: "$72,500"
+   - Texto informal: "yo digo 72.500", "creo que 71k", "apoyo a $69,800", "mi predicción es 85000"
+6. Siempre convierte a número entero o decimal en USD (sin separadores de miles)
 
 RESPONDE SOLO CON JSON (sin markdown, sin texto adicional):
 [{{"name": "usuario1", "prediction": 100000}}, {{"name": "usuario2", "prediction": 95000}}]
@@ -247,6 +255,8 @@ async def race_start(req: RaceStartRequest, background_tasks: BackgroundTasks):
         "id": session_id,
         "video_id": req.video_id,
         "max_participants": req.max_participants,
+        "game_type": req.game_type,
+        "asset": req.asset.upper(),
         "collecting": True,
         "participants": [],
         "raw_messages": [],
@@ -261,6 +271,8 @@ async def race_start(req: RaceStartRequest, background_tasks: BackgroundTasks):
         "status": "collecting",
         "video_id": req.video_id,
         "max_participants": req.max_participants,
+        "game_type": req.game_type,
+        "asset": req.asset.upper(),
     }
 
 
@@ -306,7 +318,8 @@ async def race_stop(session_id: str):
 
             parsed = await parse_with_claude(
                 [{"author": m["author"], "text": m["text"]} for m in messages_to_parse],
-                "race"
+                session.get("game_type", "race"),
+                session.get("asset", "BTC")
             )
 
             # Limit to max_participants
@@ -332,6 +345,67 @@ async def parse_chat(req: ParseChatRequest):
     return {"participants": results, "count": len(results)}
 
 
+@app.get("/api/race/{session_id}/result")
+async def race_result(session_id: str, asset: str = "BTCUSDT"):
+    """Calculate prediction game results by fetching current Binance price."""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = sessions[session_id]
+    participants = session.get("participants", [])
+
+    if not participants:
+        raise HTTPException(status_code=400, detail="No participants in session")
+
+    # Ensure asset has USDT suffix
+    if not asset.endswith("USDT"):
+        asset = asset.upper() + "USDT"
+
+    # Fetch current price from Binance
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://api.binance.com/api/v3/ticker/price?symbol={asset}",
+                timeout=10.0
+            )
+            if response.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Binance API error: {response.status_code}")
+            data = response.json()
+            current_price = float(data["price"])
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach Binance: {str(e)}")
+
+    # Calculate distances and rank
+    ranking = []
+    for p in participants:
+        prediction = p.get("prediction")
+        if prediction is None:
+            continue
+        prediction = float(prediction)
+        distance = abs(prediction - current_price)
+        ranking.append({
+            "name": p.get("name", "Unknown"),
+            "prediction": prediction,
+            "distance": round(distance, 2),
+            "difference_pct": round((prediction - current_price) / current_price * 100, 2),
+        })
+
+    # Sort by distance (closest first = winner)
+    ranking.sort(key=lambda x: x["distance"])
+
+    # Add positions
+    for i, r in enumerate(ranking):
+        r["position"] = i + 1
+
+    return {
+        "asset": asset.replace("USDT", ""),
+        "current_price": current_price,
+        "ranking": ranking,
+        "winner": ranking[0] if ranking else None,
+        "total_participants": len(ranking),
+    }
+
+
 @app.delete("/api/race/{session_id}")
 async def race_delete(session_id: str):
     """Delete a session."""
@@ -351,6 +425,8 @@ async def list_sessions():
             {
                 "id": s["id"],
                 "video_id": s["video_id"],
+                "game_type": s.get("game_type", "race"),
+                "asset": s.get("asset", ""),
                 "collecting": s["collecting"],
                 "participants": len(s["participants"]),
                 "raw_messages": len(s["raw_messages"]),
