@@ -152,7 +152,8 @@ REGLAS:
 - Sé MUY FLEXIBLE al interpretar: "voy con btc", "yo BTC", "mi voto es ethereum", "ETH porfavor", "elijo solana", "SOL!!", "DOGE 🚀" — todos son válidos
 - Si mencionan el nombre completo (bitcoin, ethereum, solana, dogecoin...) conviértelo al símbolo correcto
 - Si aparece varias veces el mismo usuario, usa su ÚLTIMO mensaje
-- Ignora spam del sistema de YouTube (Top Fans, Actividad del canal, etc.)
+- Ignora spam del sistema de YouTube (Top Fans, Actividad del canal, Miembro X meses, Usuario X meses, Nuevo miembro, etc.)
+- Ignora líneas que solo tienen información de membresía o suscripción
 - Si no hay cripto clara en el mensaje, omite ese usuario
 - NO confundas nombres de usuario con criptos
 
