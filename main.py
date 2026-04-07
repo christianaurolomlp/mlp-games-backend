@@ -26,11 +26,11 @@ except ImportError:
     logging.warning("pytchat not available - YouTube chat collection disabled")
 
 try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
 except ImportError:
-    GEMINI_AVAILABLE = False
-    logging.warning("google-generativeai SDK not available - AI parsing disabled")
+    ANTHROPIC_AVAILABLE = False
+    logging.warning("anthropic SDK not available - AI parsing disabled")
 
 # ─── Config ───────────────────────────────────────────────────────
 app = FastAPI(title="MLP Games API", version="2.0.0")
@@ -46,7 +46,7 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mlp-games")
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyAbBmA1vjy_lw_X4FVIJynTT7pEwPGwXNw")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # ─── In-memory session store ─────────────────────────────────────
 sessions: dict = {}
@@ -128,14 +128,14 @@ async def collect_chat(session_id: str, video_id: str, max_participants: int):
         sessions[session_id]["collecting"] = False
 
 
-# ─── Gemini AI Parser ─────────────────────────────────────────────
-async def parse_with_gemini(messages: list[dict], game_type: str, asset: str = "BTC") -> list[dict]:
-    if not GEMINI_AVAILABLE:
-        raise HTTPException(status_code=500, detail="google-generativeai SDK not installed")
+# ─── Anthropic AI Parser ──────────────────────────────────────────
+async def parse_with_ai(messages: list[dict], game_type: str, asset: str = "BTC") -> list[dict]:
+    if not ANTHROPIC_AVAILABLE:
+        raise HTTPException(status_code=500, detail="anthropic SDK not installed")
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set")
 
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-2.5-flash")
-
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     chat_text = "\n".join([f"{m['author']}: {m['text']}" for m in messages])
     cryptos_list = ", ".join(VALID_CRYPTOS)
 
@@ -149,19 +149,17 @@ CRIPTOS VÁLIDAS: {cryptos_list}
 
 REGLAS:
 - Extrae el nombre de usuario y la cripto que eligió
-- Sé MUY FLEXIBLE al interpretar: "voy con btc", "yo BTC", "mi voto es ethereum", "ETH porfavor", "elijo solana", "SOL!!", "DOGE 🚀" — todos son válidos
-- Si mencionan el nombre completo (bitcoin, ethereum, solana, dogecoin...) conviértelo al símbolo correcto
+- Sé MUY FLEXIBLE: "voy con btc", "yo BTC", "mi voto es ethereum", "ETH porfavor", "elijo solana", "SOL!!", "DOGE 🚀" — todos válidos
+- Si mencionan nombre completo (bitcoin, ethereum, solana, dogecoin...) conviértelo al símbolo
 - Si aparece varias veces el mismo usuario, usa su ÚLTIMO mensaje
-- Ignora spam del sistema de YouTube (Top Fans, Actividad del canal, Miembro X meses, Usuario X meses, Nuevo miembro, etc.)
-- Ignora líneas que solo tienen información de membresía o suscripción
+- Ignora líneas del sistema de YouTube (Top Fans, Actividad del canal, Miembro X meses, Usuario X meses, Nuevo miembro, etc.)
 - Si no hay cripto clara en el mensaje, omite ese usuario
 - NO confundas nombres de usuario con criptos
 
-Responde ÚNICAMENTE con JSON puro sin markdown:
+Responde SOLO con JSON sin markdown:
 [{{"name": "usuario1", "crypto": "BTC"}}, {{"name": "usuario2", "crypto": "ETH"}}]
 
 Si no hay ninguno válido: []"""
-
     else:
         prompt = f"""Eres un extractor de predicciones de precio de {asset} de un chat de YouTube.
 
@@ -171,26 +169,23 @@ COMENTARIOS DEL CHAT:
 REGLAS:
 - Extrae nombre de usuario y el número que predice como precio de {asset} en USD
 - Sé MUY FLEXIBLE: "yo digo 72.500", "creo que 71k", "$69,800", "85000", "mi pred: 75K"
-- Convierte K a miles: 71k = 71000, 2.5k = 2500
-- Punto como separador de miles (español): 72.500 = 72500
+- Convierte K a miles: 71k=71000, 2.5k=2500
+- Punto como separador de miles (español): 72.500=72500
 - Si un usuario aparece varias veces, usa su ÚLTIMA predicción
-- Ignora spam del sistema de YouTube
+- Ignora spam del sistema de YouTube (Miembro X meses, etc.)
 
-Responde ÚNICAMENTE con JSON puro sin markdown:
+Responde SOLO con JSON sin markdown:
 [{{"name": "usuario1", "prediction": 100000}}, {{"name": "usuario2", "prediction": 95000}}]
 
 Si no hay ninguno válido: []"""
 
     try:
-        response = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: model.generate_content(prompt)
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}]
         )
-        text = response.text.strip()
-
-        # Strip markdown if present
-        text = re.sub(r'^```(?:json)?\s*', '', text)
-        text = re.sub(r'\s*```$', '', text)
-
+        text = response.content[0].text.strip()
         json_match = re.search(r'\[[\s\S]*\]', text)
         if json_match:
             results = json.loads(json_match.group(0))
@@ -200,9 +195,10 @@ Si no hay ninguno válido: []"""
                     r["crypto"] = r["crypto"].upper()
             return results
         return []
-
+    except anthropic.AuthenticationError:
+        raise HTTPException(status_code=401, detail="Invalid ANTHROPIC_API_KEY")
     except Exception as e:
-        logger.error(f"Gemini parse error: {e}")
+        logger.error(f"AI parse error: {e}")
         raise HTTPException(status_code=500, detail=f"AI parsing error: {str(e)}")
 
 
@@ -218,8 +214,8 @@ async def health():
     return {
         "status": "ok",
         "pytchat": PYTCHAT_AVAILABLE,
-        "gemini": GEMINI_AVAILABLE,
-        "gemini_key_set": bool(GEMINI_API_KEY),
+        "anthropic": ANTHROPIC_AVAILABLE,
+        "anthropic_key_set": bool(ANTHROPIC_API_KEY),
         "active_sessions": len([s for s in sessions.values() if s.get("collecting")]),
     }
 
@@ -281,7 +277,7 @@ async def race_stop(session_id: str):
             if len(messages_to_parse) > 200:
                 messages_to_parse = messages_to_parse[-200:]
 
-            parsed = await parse_with_gemini(
+            parsed = await parse_with_ai(
                 [{"author": m["author"], "text": m["text"]} for m in messages_to_parse],
                 session.get("game_type", "race"),
                 session.get("asset", "BTC")
@@ -302,7 +298,7 @@ async def race_stop(session_id: str):
 @app.post("/api/parse-chat")
 async def parse_chat(req: ParseChatRequest):
     messages = [{"author": m.author, "text": m.text} for m in req.messages]
-    results = await parse_with_gemini(messages, req.game_type, req.asset)
+    results = await parse_with_ai(messages, req.game_type, req.asset)
     return {"participants": results, "count": len(results)}
 
 
