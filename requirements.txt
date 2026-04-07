@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-anthropic
+google-generativeai
 pytchat
 httpx
 python-multipart

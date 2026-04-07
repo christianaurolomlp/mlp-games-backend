@@ -1,12 +1,14 @@
 """
 MLP Games Backend - Carrera Criptos
-FastAPI backend for YouTube live chat collection + Claude AI parsing
+FastAPI backend for YouTube live chat collection + Gemini AI parsing
 """
 
 import os
 import uuid
 import asyncio
 import logging
+import json
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -24,14 +26,14 @@ except ImportError:
     logging.warning("pytchat not available - YouTube chat collection disabled")
 
 try:
-    import anthropic
-    ANTHROPIC_AVAILABLE = True
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
 except ImportError:
-    ANTHROPIC_AVAILABLE = False
-    logging.warning("anthropic SDK not available - AI parsing disabled")
+    GEMINI_AVAILABLE = False
+    logging.warning("google-generativeai SDK not available - AI parsing disabled")
 
 # ─── Config ───────────────────────────────────────────────────────
-app = FastAPI(title="MLP Games API", version="1.0.0")
+app = FastAPI(title="MLP Games API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,6 +45,8 @@ app.add_middleware(
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mlp-games")
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyAbBmA1vjy_lw_X4FVIJynTT7pEwPGwXNw")
 
 # ─── In-memory session store ─────────────────────────────────────
 sessions: dict = {}
@@ -67,32 +71,28 @@ VALID_CRYPTOS = [
     'INIT', 'HAEDAL', 'MUBARAK', 'BROCCOLI', 'TUT', 'D', 'VINE',
 ]
 
-
 # ─── Models ───────────────────────────────────────────────────────
 class RaceStartRequest(BaseModel):
     video_id: str
     max_participants: int = 15
-    game_type: str = "race"  # "race" or "prediction"
-    asset: str = "BTC"  # For prediction game: which crypto to predict
-
+    game_type: str = "race"
+    asset: str = "BTC"
 
 class RaceStopRequest(BaseModel):
     pass
-
 
 class ChatMessage(BaseModel):
     author: str
     text: str
 
-
 class ParseChatRequest(BaseModel):
     messages: list[ChatMessage]
-    game_type: str = "race"  # "race" or "prediction"
+    game_type: str = "race"
+    asset: str = "BTC"
 
 
 # ─── YouTube Chat Collector (background task) ────────────────────
 async def collect_chat(session_id: str, video_id: str, max_participants: int):
-    """Background task that collects YouTube live chat messages via pytchat."""
     if not PYTCHAT_AVAILABLE:
         logger.error("pytchat not available")
         sessions[session_id]["error"] = "pytchat not installed"
@@ -100,36 +100,27 @@ async def collect_chat(session_id: str, video_id: str, max_participants: int):
         return
 
     try:
-        # pytchat is synchronous, run in thread
         loop = asyncio.get_event_loop()
         chat = await loop.run_in_executor(None, lambda: pytchat.create(video_id=video_id, interruptable=False))
-
         logger.info(f"[{session_id}] Started collecting from video {video_id}")
 
         while sessions.get(session_id, {}).get("collecting", False):
             if not chat.is_alive():
                 logger.warning(f"[{session_id}] Chat stream ended")
                 break
-
-            # Get chat items
             items = await loop.run_in_executor(None, lambda: list(chat.get().sync_items()))
-
             for item in items:
                 if not sessions.get(session_id, {}).get("collecting", False):
                     break
-
-                msg = {
+                sessions[session_id]["raw_messages"].append({
                     "author": item.author.name,
                     "text": item.message,
                     "timestamp": item.datetime,
-                }
-                sessions[session_id]["raw_messages"].append(msg)
-
-            # Check if we have enough (after AI parsing, which happens on /stop)
+                })
             await asyncio.sleep(1)
 
         chat.terminate()
-        logger.info(f"[{session_id}] Stopped collecting. {len(sessions[session_id]['raw_messages'])} messages.")
+        logger.info(f"[{session_id}] Stopped. {len(sessions[session_id]['raw_messages'])} messages.")
 
     except Exception as e:
         logger.error(f"[{session_id}] Chat collection error: {e}")
@@ -137,81 +128,71 @@ async def collect_chat(session_id: str, video_id: str, max_participants: int):
         sessions[session_id]["collecting"] = False
 
 
-# ─── Claude AI Parser ────────────────────────────────────────────
-async def parse_with_claude(messages: list[dict], game_type: str, asset: str = "BTC") -> list[dict]:
-    """Parse chat messages using Claude to extract participants."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set")
-    if not ANTHROPIC_AVAILABLE:
-        raise HTTPException(status_code=500, detail="anthropic SDK not installed")
+# ─── Gemini AI Parser ─────────────────────────────────────────────
+async def parse_with_gemini(messages: list[dict], game_type: str, asset: str = "BTC") -> list[dict]:
+    if not GEMINI_AVAILABLE:
+        raise HTTPException(status_code=500, detail="google-generativeai SDK not installed")
 
-    client = anthropic.Anthropic(api_key=api_key)
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-2.5-flash")
 
-    # Format messages for the prompt
     chat_text = "\n".join([f"{m['author']}: {m['text']}" for m in messages])
     cryptos_list = ", ".join(VALID_CRYPTOS)
 
     if game_type == "race":
-        prompt = f"""Eres un extractor de datos de chat de YouTube para un juego de carrera de criptomonedas.
+        prompt = f"""Eres un extractor de participantes de un chat de YouTube para una carrera de criptomonedas.
 
 COMENTARIOS DEL CHAT:
 {chat_text}
 
 CRIPTOS VÁLIDAS: {cryptos_list}
 
-INSTRUCCIONES:
-1. Extrae el nombre de usuario de YouTube (está después de @ o es el nombre antes del mensaje)
-2. Extrae la criptomoneda que eligió (debe estar en la lista de válidas)
-3. Ignora líneas que son basura del sistema de YouTube (como "Top Fans", "Actividad del canal", etc.)
-4. Si un usuario aparece varias veces, usa SOLO su ÚLTIMO mensaje
-5. Si no puedes identificar claramente una cripto válida, omite ese usuario
-6. El nombre de usuario NO es una cripto - no confundas nombres como "JonVerTrader" con criptos
+REGLAS:
+- Extrae el nombre de usuario y la cripto que eligió
+- Sé MUY FLEXIBLE al interpretar: "voy con btc", "yo BTC", "mi voto es ethereum", "ETH porfavor", "elijo solana", "SOL!!", "DOGE 🚀" — todos son válidos
+- Si mencionan el nombre completo (bitcoin, ethereum, solana, dogecoin...) conviértelo al símbolo correcto
+- Si aparece varias veces el mismo usuario, usa su ÚLTIMO mensaje
+- Ignora spam del sistema de YouTube (Top Fans, Actividad del canal, etc.)
+- Si no hay cripto clara en el mensaje, omite ese usuario
+- NO confundas nombres de usuario con criptos
 
-RESPONDE SOLO CON JSON (sin markdown, sin texto adicional):
+Responde ÚNICAMENTE con JSON puro sin markdown:
 [{{"name": "usuario1", "crypto": "BTC"}}, {{"name": "usuario2", "crypto": "ETH"}}]
 
-Si no encuentras ninguno válido, responde: []"""
+Si no hay ninguno válido: []"""
+
     else:
-        # prediction game_type
-        prompt = f"""Eres un extractor de datos de chat de YouTube para un juego de predicción de precio de {asset}.
+        prompt = f"""Eres un extractor de predicciones de precio de {asset} de un chat de YouTube.
 
 COMENTARIOS DEL CHAT:
 {chat_text}
 
-INSTRUCCIONES:
-1. Extrae el nombre de usuario de YouTube (el autor del mensaje)
-2. Extrae el número que predicen como precio de {asset} (en USD)
-3. Ignora líneas de sistema de YouTube (como "Top Fans", "Actividad del canal", etc.)
-4. Si un usuario aparece varias veces, usa SOLO su ÚLTIMA predicción
-5. El número puede estar en muchos formatos:
-   - Con separador de miles: 100.000 o 100,000
-   - Sin separador: 100000
-   - Con K: "71k" = 71000, "2.5k" = 2500
-   - Con símbolo $: "$72,500"
-   - Texto informal: "yo digo 72.500", "creo que 71k", "apoyo a $69,800", "mi predicción es 85000"
-6. Siempre convierte a número entero o decimal en USD (sin separadores de miles)
+REGLAS:
+- Extrae nombre de usuario y el número que predice como precio de {asset} en USD
+- Sé MUY FLEXIBLE: "yo digo 72.500", "creo que 71k", "$69,800", "85000", "mi pred: 75K"
+- Convierte K a miles: 71k = 71000, 2.5k = 2500
+- Punto como separador de miles (español): 72.500 = 72500
+- Si un usuario aparece varias veces, usa su ÚLTIMA predicción
+- Ignora spam del sistema de YouTube
 
-RESPONDE SOLO CON JSON (sin markdown, sin texto adicional):
+Responde ÚNICAMENTE con JSON puro sin markdown:
 [{{"name": "usuario1", "prediction": 100000}}, {{"name": "usuario2", "prediction": 95000}}]
 
-Si no encuentras ninguno válido, responde: []"""
+Si no hay ninguno válido: []"""
 
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}]
+        response = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: model.generate_content(prompt)
         )
-        text = response.content[0].text.strip()
+        text = response.text.strip()
 
-        # Parse JSON from response
-        import json
-        import re
+        # Strip markdown if present
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+
         json_match = re.search(r'\[[\s\S]*\]', text)
         if json_match:
             results = json.loads(json_match.group(0))
-            # Validate cryptos for race type
             if game_type == "race":
                 results = [r for r in results if r.get("crypto", "").upper() in VALID_CRYPTOS]
                 for r in results:
@@ -219,12 +200,8 @@ Si no encuentras ninguno válido, responde: []"""
             return results
         return []
 
-    except anthropic.AuthenticationError:
-        raise HTTPException(status_code=401, detail="Invalid ANTHROPIC_API_KEY")
-    except anthropic.RateLimitError:
-        raise HTTPException(status_code=429, detail="Rate limited by Anthropic API")
     except Exception as e:
-        logger.error(f"Claude parse error: {e}")
+        logger.error(f"Gemini parse error: {e}")
         raise HTTPException(status_code=500, detail=f"AI parsing error: {str(e)}")
 
 
@@ -232,7 +209,7 @@ Si no encuentras ninguno válido, responde: []"""
 
 @app.get("/")
 async def root():
-    return {"service": "MLP Games API", "version": "1.0.0", "status": "running"}
+    return {"service": "MLP Games API", "version": "2.0.0", "status": "running"}
 
 
 @app.get("/health")
@@ -240,17 +217,15 @@ async def health():
     return {
         "status": "ok",
         "pytchat": PYTCHAT_AVAILABLE,
-        "anthropic": ANTHROPIC_AVAILABLE,
-        "anthropic_key_set": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "gemini": GEMINI_AVAILABLE,
+        "gemini_key_set": bool(GEMINI_API_KEY),
         "active_sessions": len([s for s in sessions.values() if s.get("collecting")]),
     }
 
 
 @app.post("/api/race/start")
 async def race_start(req: RaceStartRequest, background_tasks: BackgroundTasks):
-    """Start collecting chat participants for a race."""
     session_id = str(uuid.uuid4())
-
     sessions[session_id] = {
         "id": session_id,
         "video_id": req.video_id,
@@ -263,9 +238,7 @@ async def race_start(req: RaceStartRequest, background_tasks: BackgroundTasks):
         "created_at": datetime.utcnow().isoformat(),
         "error": None,
     }
-
     background_tasks.add_task(collect_chat, session_id, req.video_id, req.max_participants)
-
     return {
         "session_id": session_id,
         "status": "collecting",
@@ -278,10 +251,8 @@ async def race_start(req: RaceStartRequest, background_tasks: BackgroundTasks):
 
 @app.get("/api/race/{session_id}/participants")
 async def race_participants(session_id: str):
-    """Get current participants and raw message count."""
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-
     session = sessions[session_id]
     return {
         "participants": session["participants"],
@@ -295,36 +266,26 @@ async def race_participants(session_id: str):
 
 @app.post("/api/race/{session_id}/stop")
 async def race_stop(session_id: str):
-    """Stop collecting and parse messages with Claude."""
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-
     session = sessions[session_id]
     session["collecting"] = False
 
-    # Parse raw messages with Claude if we have any
-    if session["raw_messages"] and ANTHROPIC_AVAILABLE and os.environ.get("ANTHROPIC_API_KEY"):
+    if session["raw_messages"]:
         try:
-            # Deduplicate: keep last message per author
             seen = {}
             for msg in session["raw_messages"]:
                 seen[msg["author"]] = msg
-
             messages_to_parse = list(seen.values())
-
-            # Limit to reasonable batch size
             if len(messages_to_parse) > 200:
                 messages_to_parse = messages_to_parse[-200:]
 
-            parsed = await parse_with_claude(
+            parsed = await parse_with_gemini(
                 [{"author": m["author"], "text": m["text"]} for m in messages_to_parse],
                 session.get("game_type", "race"),
                 session.get("asset", "BTC")
             )
-
-            # Limit to max_participants
             session["participants"] = parsed[:session["max_participants"]]
-
         except Exception as e:
             logger.error(f"Error parsing messages: {e}")
             session["error"] = f"Parse error: {str(e)}"
@@ -339,29 +300,23 @@ async def race_stop(session_id: str):
 
 @app.post("/api/parse-chat")
 async def parse_chat(req: ParseChatRequest):
-    """Parse a batch of chat messages with Claude (standalone endpoint)."""
     messages = [{"author": m.author, "text": m.text} for m in req.messages]
-    results = await parse_with_claude(messages, req.game_type)
+    results = await parse_with_gemini(messages, req.game_type, req.asset)
     return {"participants": results, "count": len(results)}
 
 
 @app.get("/api/race/{session_id}/result")
 async def race_result(session_id: str, asset: str = "BTCUSDT"):
-    """Calculate prediction game results by fetching current Binance price."""
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-
     session = sessions[session_id]
     participants = session.get("participants", [])
-
     if not participants:
         raise HTTPException(status_code=400, detail="No participants in session")
 
-    # Ensure asset has USDT suffix
     if not asset.endswith("USDT"):
         asset = asset.upper() + "USDT"
 
-    # Fetch current price from Binance
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -370,12 +325,10 @@ async def race_result(session_id: str, asset: str = "BTCUSDT"):
             )
             if response.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"Binance API error: {response.status_code}")
-            data = response.json()
-            current_price = float(data["price"])
+            current_price = float(response.json()["price"])
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"Could not reach Binance: {str(e)}")
 
-    # Calculate distances and rank
     ranking = []
     for p in participants:
         prediction = p.get("prediction")
@@ -390,10 +343,7 @@ async def race_result(session_id: str, asset: str = "BTCUSDT"):
             "difference_pct": round((prediction - current_price) / current_price * 100, 2),
         })
 
-    # Sort by distance (closest first = winner)
     ranking.sort(key=lambda x: x["distance"])
-
-    # Add positions
     for i, r in enumerate(ranking):
         r["position"] = i + 1
 
@@ -408,10 +358,8 @@ async def race_result(session_id: str, asset: str = "BTCUSDT"):
 
 @app.delete("/api/race/{session_id}")
 async def race_delete(session_id: str):
-    """Delete a session."""
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-
     session = sessions.pop(session_id)
     session["collecting"] = False
     return {"deleted": True}
@@ -419,7 +367,6 @@ async def race_delete(session_id: str):
 
 @app.get("/api/sessions")
 async def list_sessions():
-    """List active sessions (admin endpoint)."""
     return {
         "sessions": [
             {
@@ -437,7 +384,6 @@ async def list_sessions():
     }
 
 
-# ─── Run ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
